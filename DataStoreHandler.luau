@@ -1,3 +1,4 @@
+--!strict
 --[[
 	Author: [FlowGostavo]
 	Last Updated: April 2026
@@ -57,7 +58,7 @@ local MAX_DEPTH = 64
 -- Module-level path cache so we don't re-parse the same dot-separated
 -- string on every single call. Keys are weakly held so unused paths
 -- don't accumulate in memory.
-local _pathCache: { [string]: { any } } = setmetatable({}, { __mode = "v" })
+local _pathCache = setmetatable({} :: { [string]: { any } }, { __mode = "v" })
 
 ------------------------------------------------------------------------
 -- INTERNAL HELPERS
@@ -149,7 +150,7 @@ local function parsePath(path: string): { any }
 	if cached then
 		return cached
 	end
-	local segments = stringSplit(path, ".")
+	local segments: { any } = stringSplit(path, ".")
 	for i, key in segments do
 		local numKey = tonumber(key)
 		if numKey ~= nil then
@@ -282,13 +283,13 @@ function DataStoreHandler.New(
 ): (DataStoreHandler, boolean)
 	if type(profileData) ~= "table" then
 		warn("DataStoreHandler.New() — profileData must be a table")
-		return nil, false
+		return nil :: any, false
 	end
 	local self = setmetatable({}, DataStoreHandler)
 	self._data = copy and deepCopy(profileData, nil, nil, maxDepth) or profileData
 	self._player = player
 	self._maxDepth = maxDepth or MAX_DEPTH
-	return self, true
+	return self :: any, true
 end
 
 function DataStoreHandler:GetPlayer(): Player
@@ -296,7 +297,7 @@ function DataStoreHandler:GetPlayer(): Player
 		return self._player
 	end
 	warn("DataStoreHandler:GetPlayer() — player not found")
-	return nil
+	return nil :: any
 end
 
 -- Returns the value stored at the dot-separated `path`.
@@ -472,7 +473,7 @@ function DataStoreHandler:RemoveByKeyList(path: string, keyList: { [any]: any })
 	end
 
 	if #numericIndicesToRemove > 0 then
-		sort(numericIndicesToRemove, function(a, b)
+		sort(numericIndicesToRemove, function(a: number, b: number)
 			return a > b
 		end)
 		for _, idx in numericIndicesToRemove do
