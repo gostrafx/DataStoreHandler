@@ -39,6 +39,8 @@ export type DataStoreHandler = {
 	Destroy: (self: DataStoreHandler) -> (),
 }
 
+type CompiledPath = { keys: { any }, last: any, len: number }
+
 ------------------------------------------------------------------------
 -- CONSTANTS
 ------------------------------------------------------------------------
@@ -48,17 +50,17 @@ local tostring = tostring
 local next = next
 local insert = table.insert
 local remove = table.remove
-local unpack = table.unpack
 local sort = table.sort
 local clear = table.clear
 local create = table.create
 local stringSplit = string.split
 
 local MAX_DEPTH = 64
+
 -- Module-level path cache so we don't re-parse the same dot-separated
 -- string on every single call. Keys are weakly held so unused paths
 -- don't accumulate in memory.
-local _pathCache = setmetatable({} :: { [string]: { any } }, { __mode = "v" })
+local _pathCache = setmetatable({} :: { [string]: CompiledPath }, { __mode = "v" })
 
 ------------------------------------------------------------------------
 -- INTERNAL HELPERS
@@ -66,7 +68,7 @@ local _pathCache = setmetatable({} :: { [string]: { any } }, { __mode = "v" })
 
 -- Recursively copies a table. A `seen` set tracks references we've
 -- already visited, so circular structures don't cause infinite loops.
--- If the tree is deeper than MAX_DEPTH we bail early and warn rather
+-- If the tree is deeper than maxDepth we bail early and warn rather
 -- than blowing the stack.
 local function deepCopy(original: any, seen: { [any]: any }?, depth: number?, maxDepth: number?): any
 	depth = depth or 0
@@ -142,10 +144,9 @@ local function deepDiff(current: any, reference: any, result: { [string]: { old:
 	end
 end
 
--- Splits a dot-separated path string into a list of keys, converting
--- any numeric segments to actual numbers so they work as array indices.
--- Results are cached at the module level.
-local function parsePath(path: string): { any }
+-- Splits a dot-separated path string into a CompiledPath struct,
+-- converting numeric segments to numbers. Results are cached.
+local function parsePath(path: string): CompiledPath
 	local cached = _pathCache[path]
 	if cached then
 		return cached
@@ -157,57 +158,68 @@ local function parsePath(path: string): { any }
 			segments[i] = numKey
 		end
 	end
-	_pathCache[path] = segments
-	return segments
+	local compiled: CompiledPath = {
+		keys = segments,
+		len = #segments,
+		last = segments[#segments],
+	}
+	_pathCache[path] = compiled
+	return compiled
 end
 
--- Walks a table by the given list of keys and returns whatever is at
--- the end, or nil if any intermediate node is missing or not a table.
-local function deepGet(t: any, path: { any }): any
-	for _, key in path do
+-- Walks a table by the full CompiledPath and returns the value at the end,
+-- or nil if any intermediate node is missing or not a table.
+local function deepGet(t: any, path: CompiledPath): any
+	local keys = path.keys
+	for i = 1, path.len do
 		if type(t) ~= "table" then
 			return nil
 		end
-		t = t[key]
+		t = t[keys[i]]
 	end
 	return t
 end
 
--- Walks a table by the given list of keys and writes `value` at the
--- last key. Intermediate tables that don't exist yet are created
--- automatically. Errors if an intermediate node exists but isn't
--- a table (e.g. trying to write under a number).
-local function deepSet(t: any, path: { any }, value: any)
-	for i = 1, #path - 1 do
-		local key = path[i]
-		local node = t[key]
+-- Walks a table by the first `n` keys of `path.keys` and returns that node.
+-- Used to navigate to the parent of the final key without allocating a copy.
+local function deepGetN(t: any, path: CompiledPath, n: number): any
+	local keys = path.keys
+	for i = 1, n do
+		if type(t) ~= "table" then
+			return nil
+		end
+		t = t[keys[i]]
+	end
+	return t
+end
+
+-- Walks a table by the given CompiledPath and writes `value` at the last key.
+-- Intermediate tables that don't exist yet are created automatically.
+-- Returns false if an intermediate node exists but isn't a table.
+local function deepSet(root: any, path: CompiledPath, value: any): boolean
+	local t = root
+	local keys = path.keys
+	for i = 1, path.len - 1 do
+		local k = keys[i]
+		local node = t[k]
 		if node == nil then
-			t[key] = {}
-			t = t[key]
+			local new = {}
+			t[k] = new
+			t = new
 		elseif type(node) ~= "table" then
-			error(
-				string.format(
-					"deepSet: node '%s' is of type '%s' (expected: table). Cannot write under it.",
-					tostring(key),
-					type(node)
-				),
-				2
-			)
+			warn("deepSet: node '" .. tostring(k) .. "' is not a table")
+			return false
 		else
 			t = node
 		end
 	end
-	t[path[#path]] = value
+	t[path.last] = value
+	return true
 end
 
 -- Recursively merges the contents of `t2` into `t1`.
---
--- For each key-value pair in `t2`:
---   - If both `t1[key]` and `t2[key]` are tables, they are merged
---     recursively.
---   - Otherwise, the value from `t2` overwrites the value in `t1`.
---
--- The merge is destructive; `t1` is modified in-place.
+-- For each key: if both values are tables, merge recursively.
+-- Otherwise the value from `t2` overwrites `t1`. Destructive on `t1`.
 local function deepMerge(t1: { [any]: any }, t2: { [any]: any })
 	for k, v in t2 do
 		if type(v) == "table" and type(t1[k]) == "table" then
@@ -226,8 +238,9 @@ local function shallowCopy(t: { [any]: any }): { [any]: any }
 	return new
 end
 
--- Shallow-copies only the nodes along `path`, leaving the rest shared.
--- Returns the new root and the parent table of the final key.
+-- Shallow-copies only the nodes along each path in `changes`, leaving
+-- the rest of the tree shared. A clone cache ensures that nodes shared
+-- by multiple paths are only copied once.
 local function cowBatch(root: { [any]: any }, changes: { [{ any }]: any }): { [any]: any }
 	local newRoot = shallowCopy(root)
 	local cloned = {}
@@ -302,17 +315,14 @@ end
 
 -- Returns the value stored at the dot-separated `path`.
 function DataStoreHandler:Get(path: string): any
-	local keys = parsePath(path)
-	return deepGet(self._data, keys)
+	return deepGet(self._data, parsePath(path))
 end
 
 -- Writes `value` at the dot-separated `path`. Missing intermediate
 -- tables are created automatically.
 function DataStoreHandler:Set(path: string, value: any): boolean
-	local keys = parsePath(path)
-	local ok, err = pcall(deepSet, self._data, keys, value)
-	if not ok then
-		warn("DataStoreHandler:Set() — " .. tostring(err))
+	if not deepSet(self._data, parsePath(path), value) then
+		warn("DataStoreHandler:Set() — failed to write at '" .. path .. "'")
 		return false
 	end
 	return true
@@ -322,25 +332,18 @@ end
 -- there yet, starts from 0. Returns false if the existing value is a
 -- non-number type.
 function DataStoreHandler:Increment(path: string, amount: number): boolean
-	local keys = parsePath(path)
-	local current = deepGet(self._data, keys)
+	local compiled = parsePath(path)
+	local current = deepGet(self._data, compiled)
 	if current ~= nil and type(current) ~= "number" then
-		warn("DataStoreHandler:Increment() — non-numeric value at '" .. keys[#keys] .. "'")
+		warn("DataStoreHandler:Increment() — non-numeric value at '" .. tostring(compiled.last) .. "'")
 		return false
 	end
-	local newValue = (current or 0) + amount
-	local ok, err = pcall(deepSet, self._data, keys, newValue)
-	if not ok then
-		warn("DataStoreHandler:Increment() — " .. tostring(err))
-		return false
-	end
-	return true
+	return deepSet(self._data, compiled, (current or 0) + amount)
 end
 
 -- Returns true if a non-nil value exists at `path`.
 function DataStoreHandler:Has(path: string): boolean
-	local keys = parsePath(path)
-	return deepGet(self._data, keys) ~= nil
+	return deepGet(self._data, parsePath(path)) ~= nil
 end
 
 -- Inserts `value` into the table at `path`.
@@ -351,8 +354,7 @@ end
 --   • string key  → dict   (merge `value`'s key-value pairs in)
 --   • empty table → falls back to inspecting `value` itself
 function DataStoreHandler:AddToList(path: string, value: any): boolean
-	local keys = parsePath(path)
-	local list = deepGet(self._data, keys)
+	local list = deepGet(self._data, parsePath(path))
 	if type(list) ~= "table" then
 		return false
 	end
@@ -390,30 +392,26 @@ end
 -- For numeric keys, uses table.remove so the array stays contiguous.
 -- For string keys, sets the entry to nil.
 function DataStoreHandler:RemoveByKey(path: string): boolean
-	local keys = parsePath(path)
-	if #keys == 0 then
+	local compiled = parsePath(path)
+	if compiled.len == 0 then
 		return false
 	end
-	local keysCopy = table.move(keys, 1, #keys, 1, {})
-	local keyToRemove = remove(keysCopy)
-
-	local list = deepGet(self._data, keysCopy)
-	if type(list) ~= "table" then
+	local parent = deepGetN(self._data, compiled, compiled.len - 1)
+	if type(parent) ~= "table" then
 		return false
 	end
-
+	local keyToRemove = compiled.last
 	if type(keyToRemove) == "number" then
-		if list[keyToRemove] ~= nil then
-			remove(list, keyToRemove)
+		if parent[keyToRemove] ~= nil then
+			remove(parent, keyToRemove)
 			return true
 		end
 	elseif type(keyToRemove) == "string" then
-		if list[keyToRemove] ~= nil then
-			list[keyToRemove] = nil
+		if parent[keyToRemove] ~= nil then
+			parent[keyToRemove] = nil
 			return true
 		end
 	end
-
 	return false
 end
 
@@ -426,13 +424,12 @@ end
 --   • Map-style    { ["Sword"] = { Equipped = false } }  — removes a dict
 --     entry only if all listed sub-fields match
 function DataStoreHandler:RemoveByKeyList(path: string, keyList: { [any]: any }): boolean
-	local keys = parsePath(path)
-	if #keys == 0 then
+	local compiled = parsePath(path)
+	if compiled.len == 0 then
 		return false
 	end
 
-	local keysCopy = table.move(keys, 1, #keys, 1, {})
-	local container = deepGet(self._data, keysCopy)
+	local container = deepGet(self._data, compiled)
 	if type(container) ~= "table" then
 		return false
 	end
@@ -487,14 +484,12 @@ end
 -- Replaces the value at the last segment of `path` with `value`.
 -- Returns false if the parent doesn't exist or the key has no value yet.
 function DataStoreHandler:UpdateList(path: string, value: any): boolean
-	local keys = parsePath(path)
-	local parentKeys = { unpack(keys) }
-	local finalKey = remove(parentKeys)
-	local parent = deepGet(self._data, parentKeys)
-	if type(parent) ~= "table" or parent[finalKey] == nil then
+	local compiled = parsePath(path)
+	local parent = deepGetN(self._data, compiled, compiled.len - 1)
+	if type(parent) ~= "table" or parent[compiled.last] == nil then
 		return false
 	end
-	parent[finalKey] = value
+	parent[compiled.last] = value
 	return true
 end
 
@@ -503,33 +498,27 @@ end
 -- as needed. Returns false if the existing value is a non-table type
 -- that would block the write.
 function DataStoreHandler:UpdateListItemProperty(path: string, value: any): boolean
-	local keys = parsePath(path)
-	local current = deepGet(self._data, keys)
+	local compiled = parsePath(path)
+	local current = deepGet(self._data, compiled)
 	if current ~= nil and type(current) ~= "table" then
 		return false
 	end
-	local ok, err = pcall(deepSet, self._data, keys, value)
-	if not ok then
-		warn("DataStoreHandler:UpdateListItemProperty() — " .. tostring(err))
-	end
-	return ok
+	return deepSet(self._data, compiled, value)
 end
 
 -- Sets the property at the last segment of `path` to nil on the parent
 -- item. Returns false if the parent isn't a table or the property
 -- doesn't exist.
 function DataStoreHandler:RemovePropertyFromListItem(path: string): boolean
-	local keys = parsePath(path)
-	if #keys == 0 then
+	local compiled = parsePath(path)
+	if compiled.len == 0 then
 		return false
 	end
-	local keysCopy = { unpack(keys) }
-	local property = remove(keysCopy)
-	local item = deepGet(self._data, keysCopy)
-	if type(item) ~= "table" or item[property] == nil then
+	local item = deepGetN(self._data, compiled, compiled.len - 1)
+	if type(item) ~= "table" or item[compiled.last] == nil then
 		return false
 	end
-	item[property] = nil
+	item[compiled.last] = nil
 	return true
 end
 
@@ -537,14 +526,12 @@ end
 -- segment. For example, "Inventory.1.Enchanted" would find the table
 -- at "Inventory.1" and set its "Enchanted" key to `value`.
 function DataStoreHandler:AddPropertyToListItem(path: string, value: any): boolean
-	local keys = parsePath(path)
-	local parentKeys = { unpack(keys) }
-	local property = remove(parentKeys)
-	local item = deepGet(self._data, parentKeys)
+	local compiled = parsePath(path)
+	local item = deepGetN(self._data, compiled, compiled.len - 1)
 	if type(item) ~= "table" then
 		return false
 	end
-	item[property] = value
+	item[compiled.last] = value
 	return true
 end
 
@@ -552,8 +539,8 @@ end
 -- Supported operations: "+", "-", "*", "/", "%".
 -- Division and modulo by zero are rejected and return false.
 function DataStoreHandler:OperateOnValue(path: string, operation: string, operand: number): boolean
-	local keys = parsePath(path)
-	local current = deepGet(self._data, keys)
+	local compiled = parsePath(path)
+	local current = deepGet(self._data, compiled)
 	if type(current) ~= "number" then
 		return false
 	end
@@ -579,8 +566,7 @@ function DataStoreHandler:OperateOnValue(path: string, operation: string, operan
 		return false
 	end
 
-	deepSet(self._data, keys, result)
-	return true
+	return deepSet(self._data, compiled, result)
 end
 
 -- Returns the raw internal data table. When the handler was created
@@ -588,6 +574,10 @@ end
 function DataStoreHandler:GetRaw(): any
 	return self._data
 end
+
+------------------------------------------------------------------------
+-- EXTENDED API
+------------------------------------------------------------------------
 
 -- Resets the value at `path` to `defaultValue`. This is just a
 -- named wrapper around Set() to make intent clearer at the call site.
@@ -598,14 +588,13 @@ end
 -- Flips the boolean stored at `path`. Returns false if the value
 -- isn't a boolean.
 function DataStoreHandler:Toggle(path: string): boolean
-	local keys = parsePath(path)
-	local current = deepGet(self._data, keys)
+	local compiled = parsePath(path)
+	local current = deepGet(self._data, compiled)
 	if type(current) ~= "boolean" then
 		warn("DataStoreHandler:Toggle() — non-boolean value at '" .. path .. "'")
 		return false
 	end
-	deepSet(self._data, keys, not current)
-	return true
+	return deepSet(self._data, compiled, not current)
 end
 
 -- Iterates the array at `path` and returns the index and value of the
@@ -617,8 +606,7 @@ end
 --       return item.Name == "Sword"
 --   end)
 function DataStoreHandler:FindInList(path: string, predicate: (value: any) -> boolean): (number?, any)
-	local keys = parsePath(path)
-	local list = deepGet(self._data, keys)
+	local list = deepGet(self._data, parsePath(path))
 	if type(list) ~= "table" then
 		return nil, nil
 	end
@@ -647,20 +635,18 @@ end
 -- Swaps the values at `pathA` and `pathB`. If writing to pathB fails,
 -- pathA is rolled back before returning.
 function DataStoreHandler:Swap(pathA: string, pathB: string): boolean
-	local keysA = parsePath(pathA)
-	local keysB = parsePath(pathB)
-	local valA = deepGet(self._data, keysA)
-	local valB = deepGet(self._data, keysB)
+	local compiledA = parsePath(pathA)
+	local compiledB = parsePath(pathB)
+	local valA = deepGet(self._data, compiledA)
+	local valB = deepGet(self._data, compiledB)
 
-	local okA, errA = pcall(deepSet, self._data, keysA, valB)
-	if not okA then
-		warn("DataStoreHandler:Swap() — pathA: " .. tostring(errA))
+	if not deepSet(self._data, compiledA, valB) then
+		warn("DataStoreHandler:Swap() — pathA failed")
 		return false
 	end
-	local okB, errB = pcall(deepSet, self._data, keysB, valA)
-	if not okB then
-		pcall(deepSet, self._data, keysA, valA) -- roll back
-		warn("DataStoreHandler:Swap() — pathB: " .. tostring(errB))
+	if not deepSet(self._data, compiledB, valA) then
+		deepSet(self._data, compiledA, valA)
+		warn("DataStoreHandler:Swap() — pathB failed")
 		return false
 	end
 	return true
@@ -669,27 +655,23 @@ end
 -- Moves the element at `fromIndex` to `toIndex` inside the array at
 -- `path`. The surrounding elements shift automatically.
 function DataStoreHandler:MoveInList(path: string, fromIndex: number, toIndex: number): boolean
-	local keys = parsePath(path)
-	local list = deepGet(self._data, keys)
+	local list = deepGet(self._data, parsePath(path))
 	if type(list) ~= "table" then
 		return false
 	end
 	if list[fromIndex] == nil then
 		return false
 	end
-	local item = remove(list, fromIndex)
-	insert(list, toIndex, item)
+	insert(list, toIndex, remove(list, fromIndex))
 	return true
 end
 
 -- Returns the number of elements in the table at `path`, whether it's
 -- an array or a dictionary. Returns nil if `path` doesn't point to a
--- table.
--- Uses the length operator for pure arrays (O(1)); falls back to
+-- table. Uses the length operator for pure arrays (O(1)); falls back to
 -- counting pairs for dictionaries or mixed tables (O(n)).
 function DataStoreHandler:CountList(path: string): number?
-	local keys = parsePath(path)
-	local list = deepGet(self._data, keys)
+	local list = deepGet(self._data, parsePath(path))
 	if type(list) ~= "table" then
 		return nil
 	end
@@ -703,10 +685,9 @@ function DataStoreHandler:CountList(path: string): number?
 	return count
 end
 
--- Applies multiple Set operations as a single atomic unit. All changes
--- are first applied to a deep copy of the data. If any one of them
--- fails, the original data is left completely untouched. Only on full
--- success is the internal data swapped out for the modified copy.
+-- Applies multiple Set operations as a single atomic unit using COW.
+-- Only the branches touched are cloned. If anything fails, `_data` is
+-- left untouched.
 --
 -- Example:
 --   handler:BatchSet({
@@ -717,7 +698,7 @@ end
 function DataStoreHandler:BatchSet(changes: { [string]: any }): boolean
 	local compiled = {}
 	for path, value in changes do
-		compiled[parsePath(path)] = value
+		compiled[parsePath(path).keys] = value
 	end
 	local ok, result = pcall(cowBatch, self._data, compiled)
 	if not ok then
@@ -728,35 +709,16 @@ function DataStoreHandler:BatchSet(changes: { [string]: any }): boolean
 	return true
 end
 
--- Applies multiple pre-compiled path updates in a single atomic operation.
---
--- This version expects "compiled paths" instead of strings, meaning each key
--- is already a table of path segments (e.g. { "Stats", "Coins" }).
---
--- Benefits:
---   • No string parsing (string.split avoided)
---   • Lower GC pressure
---   • Faster batch writes for ProfileService-style saves
---   • Atomic update (all changes applied together via COW)
+-- Same as BatchSet but accepts pre-compiled path arrays, skipping
+-- all parsing overhead at call time.
 --
 -- Example:
---   local changes = {
---       [{ "Coins" }] = 1000,
---       [{ "Stats", "Level" }] = 10,
---       [{ "Inventory", 1, "Name" }] = "Sword"
---   }
---
---   handler:BatchSetCompiled(changes)
---
--- 	local PATH_COINS = { "Coins" }
--- 	local PATH_LEVEL = { "Stats", "Level" }
--- 	local PATH_XP = { "Stats", "XP" }
---
--- 	handler:BatchSetCompiled({
---	 [PATH_COINS] = 1500,
---	 [PATH_LEVEL] = 12,
---	 [PATH_XP] = 3400
--- 	})
+--   local PATH_COINS = { "Coins" }
+--   local PATH_LEVEL = { "Stats", "Level" }
+--   handler:BatchSetCompiled({
+--       [PATH_COINS] = 1500,
+--       [PATH_LEVEL] = 12,
+--   })
 function DataStoreHandler:BatchSetCompiled(changes: { [{ any }]: any }): boolean
 	local ok, result = pcall(cowBatch, self._data, changes)
 	if not ok then
@@ -775,9 +737,7 @@ end
 --   handler:Patch("Settings", { Audio = { Volume = 0.5 } })
 --   -- Settings.Video is left as-is
 function DataStoreHandler:Patch(path: string, partialData: { [any]: any }): boolean
-	local keys = parsePath(path)
-	local target = deepGet(self._data, keys)
-
+	local target = deepGet(self._data, parsePath(path))
 	if type(target) ~= "table" then
 		warn("DataStoreHandler:Patch() — target at '" .. path .. "' is not a table")
 		return false
@@ -789,13 +749,10 @@ end
 -- Empties the table at `path` without destroying the table itself, so
 -- any existing references to it remain valid.
 function DataStoreHandler:ClearList(path: string): boolean
-	local keys = parsePath(path)
-	local target = deepGet(self._data, keys)
-
+	local target = deepGet(self._data, parsePath(path))
 	if type(target) ~= "table" then
 		return false
 	end
-
 	clear(target)
 	return true
 end
@@ -804,13 +761,10 @@ end
 -- is omitted, the last element is popped. Returns nil if the array is
 -- empty or the path doesn't point to a table.
 function DataStoreHandler:PopFromList(path: string, index: number?): any
-	local keys = parsePath(path)
-	local target = deepGet(self._data, keys)
-
+	local target = deepGet(self._data, parsePath(path))
 	if type(target) ~= "table" or #target == 0 then
 		return nil
 	end
-
 	return remove(target, index)
 end
 
@@ -822,13 +776,10 @@ end
 -- Example:
 --   handler:MapList("Stats.Multipliers", function(val) return val * 2 end)
 function DataStoreHandler:MapList(path: string, transform: (value: any) -> any): boolean
-	local keys = parsePath(path)
-	local target = deepGet(self._data, keys)
-
+	local target = deepGet(self._data, parsePath(path))
 	if type(target) ~= "table" then
 		return false
 	end
-
 	for k, v in target do
 		local ok, result = pcall(transform, v)
 		if ok and result ~= nil then
@@ -837,7 +788,6 @@ function DataStoreHandler:MapList(path: string, transform: (value: any) -> any):
 			warn("DataStoreHandler:MapList() — transform failed at key " .. tostring(k) .. ": " .. tostring(result))
 		end
 	end
-
 	return true
 end
 
@@ -857,23 +807,21 @@ end
 -- section, use Set() instead:
 --   handler:Set("Stats", handler:SnapshotPath("Stats"))
 function DataStoreHandler:SnapshotPath(path: string): any
-	local keys = parsePath(path)
-	local node = deepGet(self._data, keys)
+	local node = deepGet(self._data, parsePath(path))
 	if node == nil then
 		return nil
 	end
 	return deepCopy(node, nil, nil, self._maxDepth)
 end
 
--- Replaces the current data with a deep copy of `snapshot`. The copy
--- ensures that subsequent changes to the handler can't corrupt the
--- snapshot you're holding.
+-- Replaces the current data with `snapshot`. The snapshot must be an
+-- isolated copy (returned by Snapshot()) — it is assigned directly
+-- without an extra deepCopy since Snapshot() already guarantees isolation.
 function DataStoreHandler:Restore(snapshot: any): boolean
 	if type(snapshot) ~= "table" then
 		warn("DataStoreHandler:Restore() — invalid snapshot")
 		return false
 	end
-	-- Snapshot is already an isolated copy, so we can assign it directly.
 	self._data = snapshot
 	return true
 end
