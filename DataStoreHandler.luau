@@ -7,7 +7,7 @@ export type DataStoreHandler = {
 	New: (profileData: any, player: Player, copy: boolean?, maxDepth: number?) -> (DataStoreHandler, boolean),
 	Get: (self: DataStoreHandler, path: string) -> any,
 	Set: (self: DataStoreHandler, path: string, value: any) -> boolean,
-	Patch: (self: DataStoreHandler, path: string, partialData: table) -> boolean,
+	Patch: (self: DataStoreHandler, path: string, partialData: { [any]: any }) -> boolean,
 	Increment: (self: DataStoreHandler, path: string, amount: number) -> boolean,
 	OperateOnValue: (self: DataStoreHandler, path: string, operation: string, operand: number) -> boolean,
 	Has: (self: DataStoreHandler, path: string) -> boolean,
@@ -35,7 +35,7 @@ export type DataStoreHandler = {
 	Snapshot: (self: DataStoreHandler) -> any,
 	SnapshotPath: (self: DataStoreHandler, path: string) -> any,
 	Restore: (self: DataStoreHandler, snapshot: any) -> boolean,
-	Destroy: (self: DataStoreHandler) -> void,
+	Destroy: (self: DataStoreHandler) -> (),
 }
 
 ------------------------------------------------------------------------
@@ -424,7 +424,7 @@ end
 --   • Array-style  { "Sword", "Shield" }  — removes those string/number keys
 --   • Map-style    { ["Sword"] = { Equipped = false } }  — removes a dict
 --     entry only if all listed sub-fields match
-function DataStoreHandler:RemoveByKeyList(path: string, keyList: table): boolean
+function DataStoreHandler:RemoveByKeyList(path: string, keyList: { [any]: any }): boolean
 	local keys = parsePath(path)
 	if #keys == 0 then
 		return false
@@ -773,7 +773,7 @@ end
 -- Example:
 --   handler:Patch("Settings", { Audio = { Volume = 0.5 } })
 --   -- Settings.Video is left as-is
-function DataStoreHandler:Patch(path: string, partialData: table): boolean
+function DataStoreHandler:Patch(path: string, partialData: { [any]: any }): boolean
 	local keys = parsePath(path)
 	local target = deepGet(self._data, keys)
 
