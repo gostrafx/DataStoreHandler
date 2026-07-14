@@ -60,7 +60,7 @@ local MAX_DEPTH = 64
 -- Module-level path cache so we don't re-parse the same dot-separated
 -- string on every single call. Keys are weakly held so unused paths
 -- don't accumulate in memory.
-local _pathCache = setmetatable({} :: { [string]: CompiledPath }, { __mode = "v" })
+local _pathCache: { [string]: CompiledPath } = {}
 
 ------------------------------------------------------------------------
 -- INTERNAL HELPERS
@@ -88,7 +88,7 @@ local function deepCopy(original: any, seen: { [any]: any }?, depth: number?, ma
 	seen[original] = true
 	local copy = {}
 	for k, v in original do
-		copy[deepCopy(k, seen, depth + 1, maxDepth)] = deepCopy(v, seen, depth + 1, maxDepth)
+		copy[k] = deepCopy(v, seen, depth + 1, maxDepth)
 	end
 	-- We deliberately leave seen[original] set. If the same table
 	-- appears in multiple branches of the tree, we need to know we've
@@ -217,15 +217,21 @@ local function deepSet(root: any, path: CompiledPath, value: any): boolean
 	return true
 end
 
--- Recursively merges the contents of `t2` into `t1`.
+-- Iteratively merges the contents of `t2` into `t1`.
 -- For each key: if both values are tables, merge recursively.
 -- Otherwise the value from `t2` overwrites `t1`. Destructive on `t1`.
 local function deepMerge(t1: { [any]: any }, t2: { [any]: any })
-	for k, v in t2 do
-		if type(v) == "table" and type(t1[k]) == "table" then
-			deepMerge(t1[k], v)
-		else
-			t1[k] = v
+	local stack = { { dst = t1, src = t2 } }
+	while #stack > 0 do
+		local n = #stack
+		local frame = stack[n]
+		stack[n] = nil
+		for k, v in frame.src do
+			if type(v) == "table" and type(frame.dst[k]) == "table" then
+				insert(stack, { dst = frame.dst[k], src = v })
+			else
+				frame.dst[k] = v
+			end
 		end
 	end
 end
@@ -705,7 +711,10 @@ function DataStoreHandler:BatchSet(changes: { [string]: any }): boolean
 		warn("DataStoreHandler:BatchSet() — " .. tostring(result))
 		return false
 	end
-	self._data = result
+	clear(self._data)
+	for k, v in result do
+		self._data[k] = v
+	end
 	return true
 end
 
@@ -725,7 +734,10 @@ function DataStoreHandler:BatchSetCompiled(changes: { [{ any }]: any }): boolean
 		warn("DataStoreHandler:BatchSetCompiled() — " .. tostring(result))
 		return false
 	end
-	self._data = result
+	clear(self._data)
+	for k, v in result do
+		self._data[k] = v
+	end
 	return true
 end
 
@@ -822,7 +834,10 @@ function DataStoreHandler:Restore(snapshot: any): boolean
 		warn("DataStoreHandler:Restore() — invalid snapshot")
 		return false
 	end
-	self._data = snapshot
+	clear(self._data)
+	for k, v in snapshot do
+		self._data[k] = v
+	end
 	return true
 end
 
@@ -830,6 +845,7 @@ function DataStoreHandler:Destroy()
 	self._data = nil
 	self._player = nil
 	self._maxDepth = nil
+	setmetatable(self, nil)
 end
 
 return DataStoreHandler
